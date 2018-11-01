@@ -1,19 +1,20 @@
 const _ = require('lodash');
 const Promise = require('promise');
 const async = require('async');
+
 const Transaction = require('../models/transaction.model');
 const config = require('../config/transaction.config');
 const cluster = require('./cluster.controller');
 
-// Function to test timeout functionality in express.
-exports.test = function (req, res) {
+// Function to test timeout in express.
+exports.test_timeout = function (req, res) {
     setTimeout(function () {
-        res.status(200).send('Greetings from the Test controller!');
+        res.status(200).send('This function is supposed to timeout! You should not be receiving this!');
     }, 15 * 1000);
 }
 
-// Makes a group of user + company to feed to the model which predicts amount and date for next txn for that user.
-function transaction_get_reccuring(req, res) {
+// Makes a group of user + company to feed to the clustering algorithm for prediction.
+function transaction_get_recurring(req, res) {
     return new Promise(function (resolve, reject) {
         let users = _.uniq(_.map(req.body, 'user_id'));
         let filter = {}
@@ -27,111 +28,103 @@ function transaction_get_reccuring(req, res) {
         Transaction.find(filter, function (err, transactions) {
             if (err) return err.message;
             const result = _.chain(transactions)
-                .groupBy('user_id')
+                .groupBy('user_id') // Group by users first
                 .mapValues(values => _.chain(values)
-                    .groupBy('company')
+                    .groupBy('company') // Form clusters of companies inside the parent user groups.
                     .value()
                 )
-                .value()
+                .value();
             res.send(cluster.apply_cluster(result));
         });
     });
 }
 
-//Differences usually come in the form of reference numbers (e.g., ABC 23XAB vs.
-//ABC YA78P) or dates (ABC 20180901 vs. ABC 20180801)
+//Differences usually come in the form of reference numbers 
+// (e.g., ABC 23XAB vs.ABC YA78P) or dates (ABC 20180901 vs. ABC 20180801)
 let companyRegex = /[ -!$%^&*()_+|~=`{}\[\]:\/;<>?,.@#]/g;
+
 function getCompany(inputName) {
     let match = inputName.match(companyRegex);
     let lastIndex = inputName.lastIndexOf(match[match.length - 1]);
     return inputName.substring(0, lastIndex).trim();
 }
 
-function getDiff(current, last) {
-    let oneDay = 1000 * 60 * 60 * 24;
-    let lastMs = new Date(last).getTime();
-    let currentMs = new Date(current).getTime();
-    let diffMs = currentMs - lastMs;
-    return Math.round(diffMs / oneDay);
-}
-
+// Don't use this, rather find difference in days while clustering, this is an overhead, 
+// because these values are pull anyway and sorted before sending recurring txns. 
 // Returns the difference of days between the current txn and the last done txn.
-async function getDays(userId, companyName, currentDate) {
+async function get_days(user_id, company_name, current_date) {
     return new Promise(function (resolve, reject) {
         Transaction
             .find({
-                user_id: userId,
-                company: companyName
+                user_id: user_id,
+                company: company_name
             })
-            .sort({ 'date': -1 })
+            .sort({
+                'date': -1
+            })
             .limit(1)
             .exec(function (err, record) {
                 if (err) {
                     console.log(err.message);
                     reject(err);
                 }
-                if (record && record[0]) resolve(getDiff(currentDate, record[0].date));
+                if (record && record[0]) resolve(getDiff(current_date, record[0].date));
                 resolve(0)
             });
     });
 }
 
-function chunkArray(myArray, chunk_size) {
-    var results = [];
-    while (myArray.length) {
-        results.push(myArray.splice(0, chunk_size));
+// Divide a big array into smaller equal sized chunks.
+function chunk_array(big_array, chunk_size) {
+    var chunks = [];
+    while (big_array.length) {
+        chunks.push(big_array.splice(0, chunk_size));
     }
-    return results;
+    return chunks;
 }
 
-// After transaction is created, we need to return the reccuring transactions for that user.
-// So reuse the function that is used to return the recurring transactions from the other request. (Line 61)
+// This creates a set of transactions and writes to database in smaller chunks.
+// After inserting to db, this calls the handler for returning recurring functions API and
+// returns the recurring transactions for all users for whom transactions are created here.
 function transaction_create(req, res) {
-    let reqArr = req.body;
-    let bulkUpdates = [];
-    let total_records = req.body.length;
+    let req_arr = req.body;
+    let bulk_updates = [];
 
-    async.every(reqArr, function (doc, callback) {
+    _.forEach(req_arr, function (doc, callback) {
         doc['company'] = getCompany(doc.name);
-        getDays(doc.user_id, doc.company, doc.date)
-            .then(function (days) {
-                bulkUpdates.push({
-                    "updateOne": {
-                        "filter": {
-                            "trans_id": doc.trans_id
-                        },
-                        "update": {
-                            "$set": {
-                                "name": doc.name,
-                                "company": doc.company,
-                                "amount": doc.amount,
-                                "date": doc.date,
-                                "user_id": doc.user_id,
-                                "trans_id": doc.trans_id,
-                                "days": days
-                            }
-                        },
-                        "upsert": true,     //Avoid duplication of transactions
-                        "multi": true
+        bulk_updates.push({
+            "updateOne": {
+                "filter": {
+                    "trans_id": doc.trans_id
+                },
+                "update": {
+                    "$set": {
+                        "name": doc.name,
+                        "company": doc.company,
+                        "amount": doc.amount,
+                        "date": doc.date,
+                        "user_id": doc.user_id,
+                        "trans_id": doc.trans_id
                     }
-                });
-                if (bulkUpdates.length == total_records) callback();
-            });
-
-    }, function (err) {
-        if (err) return console.log(err);
-        // Break the txns array into smaller chunks based on the size set in config file
-        let bulks = chunkArray(bulkUpdates, config.BULK_INSERT_SIZE);
-        let total_bulks = bulks.length;
-        async.every(bulks, function (bulk, callback) {
-            Transaction.bulkWrite(bulk, function () {
-                if (--total_bulks == 0) callback();
-            });
-        }, function () {
-            transaction_get_reccuring(req, res);
+                },
+                "upsert": true, // Avoid duplication of transactions
+                "multi": true
+            }
         });
-    })
+    });
+
+    // Break the txns array into smaller chunks based on the size set in config file
+    let bulks = chunk_array(bulk_updates, config.BULK_INSERT_SIZE);
+    let total_bulks = bulks.length;
+    async.every(bulks, function (bulk, callback) {
+        Transaction.bulkWrite(bulk, function () {
+            // Only send the response when all the chunks of transactions have been written to db.
+            if (--total_bulks == 0) callback();
+        });
+    }, function () {
+        transaction_get_recurring(req, res);
+    });
 }
 
 exports.transaction_create = transaction_create;
-exports.transaction_get_reccuring = transaction_get_reccuring;
+exports.transaction_get_recurring = transaction_get_recurring;

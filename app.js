@@ -28,4 +28,4 @@ db.on('error', console.error.bind(console, 'MongoDB connection error:'));
 const server = app.listen(port, () => {
     console.log('The app is running at - http://localhost:' + port);
 });
-server.timeout = config.SERVER_CONNECTION_TIMEOUT_IN_SECONDS*1000;
+server.timeout = config.SERVER_REQUEST_TIMEOUT_IN_SECONDS*1000;
